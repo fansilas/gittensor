@@ -879,88 +879,129 @@ def try_add_open_or_closed_pr(
             miner_eval.add_closed_pull_request(pr_raw)
 
 
+def _skip_if_missing_merged_at(pr_raw: Dict) -> Optional[str]:
+    if not pr_raw['mergedAt']:
+        return f'PR #{pr_raw["number"]} is MERGED, but missing a mergedAt timestamp. Skipping...'
+    return None
+
+
+def _skip_if_outside_lookback(pr_raw: Dict, repository_full_name: str, lookback_date_filter: datetime) -> Optional[str]:
+    merged_dt = parse_github_iso_to_utc(pr_raw['mergedAt'])
+    if merged_dt < lookback_date_filter:
+        return (
+            f'Skipping PR #{pr_raw["number"]} in {repository_full_name} - '
+            f'merged before {PR_LOOKBACK_DAYS}-day lookback window'
+        )
+    return None
+
+
+def _skip_if_maintainer_author(pr_raw: Dict, repository_full_name: str) -> Optional[str]:
+    author_association = pr_raw.get('authorAssociation')
+    if os.environ.get('DEV_MODE') or author_association not in MAINTAINER_ASSOCIATIONS:
+        return None
+    return (
+        f'Skipping PR #{pr_raw["number"]} in {repository_full_name} - '
+        f'author is {author_association} (has direct merge capabilities)'
+    )
+
+
+def _skip_if_self_merge_without_approval(pr_raw: Dict, repository_full_name: str) -> Optional[str]:
+    if not pr_raw['mergedBy'] or pr_raw['author']['login'] != pr_raw['mergedBy']['login']:
+        return None
+    reviews = pr_raw.get('reviews', {}).get('nodes', [])
+    has_external_approval = any(
+        review.get('author') and review['author']['login'] != pr_raw['author']['login'] for review in reviews
+    )
+    if has_external_approval:
+        return None
+    return f'Skipping PR #{pr_raw["number"]} in {repository_full_name} - self-merged, no approval'
+
+
+def _skip_if_source_branch_is_acceptable(
+    pr_raw: Dict, repository_full_name: str, acceptable_branches: List[str]
+) -> Optional[str]:
+    """Reject internal PRs whose source branch is itself an acceptable branch.
+
+    Prevents PRs like 'staging -> main' or 'develop -> staging' where both
+    sides are acceptable branches. Only applied to PRs from the same
+    repository (forks have arbitrary branch names). Supports wildcard
+    patterns (e.g., '*-dev' matches '3.0-dev', '3.1-dev', etc.).
+    """
+    head_repo = pr_raw.get('headRepository')
+    if not head_repo or parse_repo_name(head_repo) != repository_full_name:
+        return None
+    head_ref = pr_raw.get('headRefName', '')
+    if not branch_matches_pattern(head_ref, acceptable_branches):
+        return None
+    return (
+        f'Skipping PR #{pr_raw["number"]} in {repository_full_name} - '
+        f"source branch '{head_ref}' is an acceptable branch (merging between acceptable branches not allowed)"
+    )
+
+
+def _skip_if_target_branch_not_acceptable(
+    pr_raw: Dict, repository_full_name: str, default_branch: str, acceptable_branches: List[str]
+) -> Optional[str]:
+    """Reject PRs merged into a branch outside the acceptable set.
+
+    Supports wildcard patterns (e.g., '*-dev' matches '3.0-dev', '3.1-dev', etc.).
+    """
+    base_ref = pr_raw['baseRefName']
+    if branch_matches_pattern(base_ref, acceptable_branches):
+        return None
+    return (
+        f'Skipping PR #{pr_raw["number"]} in {repository_full_name} - '
+        f"merged to '{base_ref}' (not default branch '{default_branch}' or additional acceptable branches)"
+    )
+
+
 def should_skip_merged_pr(
     pr_raw: Dict,
     repository_full_name: str,
     repo_config: RepositoryConfig,
     lookback_date_filter: datetime,
 ) -> tuple[bool, Optional[str]]:
-    """
-    Validate a merged PR against all eligibility criteria.
+    """Validate a merged PR against all eligibility criteria.
+
+    Each criterion is a private ``_skip_*`` predicate that returns the rejection
+    reason or ``None`` when the PR passes. Predicates run in order so the first
+    failure short-circuits with its reason.
 
     Args:
-        pr_raw (Dict): Raw PR data from GraphQL
-        repository_full_name (str): Full repository name (owner/repo)
-        repo_config (RepositoryConfig): Repository configuration
-        lookback_date_filter (datetime): Date filter for lookback period
+        pr_raw: Raw PR data from GraphQL
+        repository_full_name: Full repository name (``owner/repo``)
+        repo_config: Repository configuration
+        lookback_date_filter: Date filter for the lookback window
 
     Returns:
-        tuple[bool, Optional[str]]: (should_skip, skip_reason) - True if PR should be skipped with reason
+        ``(should_skip, skip_reason)``: ``True`` and a reason if the PR is
+        skipped, otherwise ``(False, None)``.
     """
+    if reason := _skip_if_missing_merged_at(pr_raw):
+        return (True, reason)
 
-    if not pr_raw['mergedAt']:
-        return (True, f'PR #{pr_raw["number"]} is MERGED, but missing a mergedAt timestamp. Skipping...')
+    if reason := _skip_if_outside_lookback(pr_raw, repository_full_name, lookback_date_filter):
+        return (True, reason)
 
-    merged_dt = parse_github_iso_to_utc(pr_raw['mergedAt'])
+    if reason := _skip_if_maintainer_author(pr_raw, repository_full_name):
+        return (True, reason)
 
-    # Filter by lookback window
-    if merged_dt < lookback_date_filter:
-        return (
-            True,
-            f'Skipping PR #{pr_raw["number"]} in {repository_full_name} - merged before {PR_LOOKBACK_DAYS}-day lookback window',
-        )
+    if reason := _skip_if_self_merge_without_approval(pr_raw, repository_full_name):
+        return (True, reason)
 
-    # Skip if PR author is a maintainer
-    author_association = pr_raw.get('authorAssociation')
-    if not os.environ.get('DEV_MODE') and author_association in MAINTAINER_ASSOCIATIONS:
-        return (
-            True,
-            f'Skipping PR #{pr_raw["number"]} in {repository_full_name} - author is {author_association} (has direct merge capabilities)',
-        )
-
-    # Skip if PR was merged by the same person who created it (self-merge) AND there's no approvals from a differing party
-    if pr_raw['mergedBy'] and pr_raw['author']['login'] == pr_raw['mergedBy']['login']:
-        # Check if there are any approvals from users other than the author
-        reviews = pr_raw.get('reviews', {}).get('nodes', [])
-        has_external_approval = any(
-            review.get('author') and review['author']['login'] != pr_raw['author']['login'] for review in reviews
-        )
-
-        if not has_external_approval:
-            return (True, f'Skipping PR #{pr_raw["number"]} in {repository_full_name} - self-merged, no approval')
-
-    # Skip if PR was not merged to an acceptable branch (default or additional)
     default_branch = (
         pr_raw['repository']['defaultBranchRef']['name'] if pr_raw['repository']['defaultBranchRef'] else 'main'
     )
-    base_ref = pr_raw['baseRefName']
-    head_ref = pr_raw.get('headRefName', '')  # Source branch (where PR is coming FROM)
-    additional_branches = repo_config.additional_acceptable_branches or []
-    acceptable_branches = [default_branch] + additional_branches
+    acceptable_branches = [default_branch] + (repo_config.additional_acceptable_branches or [])
 
-    # Skip if the source branch (headRef) is also an acceptable branch
-    # This prevents PRs like "staging -> main" or "develop -> staging" where both are acceptable branches
-    # This check ONLY applies to internal PRs (same repository), as fork branch names are arbitrary.
-    # Supports wildcard patterns (e.g., '*-dev' matches '3.0-dev', '3.1-dev', etc.)
-    head_repo = pr_raw.get('headRepository')
-    if head_repo and parse_repo_name(head_repo) == repository_full_name:
-        if branch_matches_pattern(head_ref, acceptable_branches):
-            return (
-                True,
-                f'Skipping PR #{pr_raw["number"]} in {repository_full_name} - '
-                f"source branch '{head_ref}' is an acceptable branch (merging between acceptable branches not allowed)",
-            )
+    if reason := _skip_if_source_branch_is_acceptable(pr_raw, repository_full_name, acceptable_branches):
+        return (True, reason)
 
-    # Check if merged to an acceptable branch (default or additional)
-    # Supports wildcard patterns (e.g., '*-dev' matches '3.0-dev', '3.1-dev', etc.)
-    if not branch_matches_pattern(base_ref, acceptable_branches):
-        return (
-            True,
-            f'Skipping PR #{pr_raw["number"]} in {repository_full_name} - '
-            f"merged to '{base_ref}' (not default branch '{default_branch}' or additional acceptable branches)",
-        )
+    if reason := _skip_if_target_branch_not_acceptable(
+        pr_raw, repository_full_name, default_branch, acceptable_branches
+    ):
+        return (True, reason)
 
-    # All checks passed
     return (False, None)
 
 

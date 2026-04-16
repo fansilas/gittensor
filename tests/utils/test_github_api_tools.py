@@ -1513,5 +1513,281 @@ class TestFetchFileContentsForPrMergeBase:
         assert call_args[0][2] == 'base_branch_tip_sha', 'Should fall back to base_ref_oid'
 
 
+# ============================================================================
+# should_skip_merged_pr predicate tests
+# ============================================================================
+
+
+_skip_if_missing_merged_at = github_api_tools._skip_if_missing_merged_at
+_skip_if_outside_lookback = github_api_tools._skip_if_outside_lookback
+_skip_if_maintainer_author = github_api_tools._skip_if_maintainer_author
+_skip_if_self_merge_without_approval = github_api_tools._skip_if_self_merge_without_approval
+_skip_if_source_branch_is_acceptable = github_api_tools._skip_if_source_branch_is_acceptable
+_skip_if_target_branch_not_acceptable = github_api_tools._skip_if_target_branch_not_acceptable
+should_skip_merged_pr = github_api_tools.should_skip_merged_pr
+
+
+def _repo_config(additional=None):
+    from gittensor.validator.utils.load_weights import RepositoryConfig
+
+    return RepositoryConfig(weight=1.0, additional_acceptable_branches=additional)
+
+
+def _within_lookback_pr(**overrides):
+    """Build a PR node whose mergedAt is recent enough to pass the lookback gate."""
+    recent = (datetime.now(timezone.utc) - timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    pr = _make_pr_node(1, 'goodorg', 'goodrepo', merged_at=recent)
+    pr.update(overrides)
+    return pr
+
+
+class TestSkipIfMissingMergedAt:
+    def test_missing_returns_reason(self):
+        pr = _make_pr_node(42, 'org', 'repo')
+        pr['mergedAt'] = None
+        reason = _skip_if_missing_merged_at(pr)
+        assert reason is not None
+        assert 'PR #42' in reason
+        assert 'mergedAt' in reason
+
+    def test_present_returns_none(self):
+        pr = _make_pr_node(42, 'org', 'repo')
+        assert _skip_if_missing_merged_at(pr) is None
+
+
+class TestSkipIfOutsideLookback:
+    def test_outside_returns_reason(self):
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        old = (datetime.now(timezone.utc) - timedelta(days=60)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        pr = _make_pr_node(7, 'org', 'repo', merged_at=old)
+        reason = _skip_if_outside_lookback(pr, 'org/repo', cutoff)
+        assert reason is not None
+        assert 'PR #7' in reason
+        assert 'lookback window' in reason
+
+    def test_inside_returns_none(self):
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        recent = (datetime.now(timezone.utc) - timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        pr = _make_pr_node(7, 'org', 'repo', merged_at=recent)
+        assert _skip_if_outside_lookback(pr, 'org/repo', cutoff) is None
+
+
+class TestSkipIfMaintainerAuthor:
+    @pytest.fixture(autouse=True)
+    def _clear_dev_mode(self, monkeypatch):
+        monkeypatch.delenv('DEV_MODE', raising=False)
+
+    @pytest.mark.parametrize('association', ['OWNER', 'MEMBER', 'COLLABORATOR'])
+    def test_maintainer_returns_reason(self, association):
+        pr = _make_pr_node(1, 'org', 'repo')
+        pr['authorAssociation'] = association
+        reason = _skip_if_maintainer_author(pr, 'org/repo')
+        assert reason is not None
+        assert association in reason
+        assert 'direct merge capabilities' in reason
+
+    def test_non_maintainer_returns_none(self):
+        pr = _make_pr_node(1, 'org', 'repo')
+        pr['authorAssociation'] = 'CONTRIBUTOR'
+        assert _skip_if_maintainer_author(pr, 'org/repo') is None
+
+    def test_missing_association_returns_none(self):
+        pr = _make_pr_node(1, 'org', 'repo')
+        pr.pop('authorAssociation', None)
+        assert _skip_if_maintainer_author(pr, 'org/repo') is None
+
+    def test_dev_mode_bypasses(self, monkeypatch):
+        monkeypatch.setenv('DEV_MODE', '1')
+        pr = _make_pr_node(1, 'org', 'repo')
+        pr['authorAssociation'] = 'OWNER'
+        assert _skip_if_maintainer_author(pr, 'org/repo') is None
+
+
+class TestSkipIfSelfMergeWithoutApproval:
+    def test_self_merge_no_approval_returns_reason(self):
+        pr = _make_pr_node(99, 'org', 'repo')
+        pr['author'] = {'login': 'alice'}
+        pr['mergedBy'] = {'login': 'alice'}
+        pr['reviews'] = {'nodes': []}
+        reason = _skip_if_self_merge_without_approval(pr, 'org/repo')
+        assert reason is not None
+        assert 'self-merged, no approval' in reason
+
+    def test_self_merge_with_external_approval_returns_none(self):
+        pr = _make_pr_node(99, 'org', 'repo')
+        pr['author'] = {'login': 'alice'}
+        pr['mergedBy'] = {'login': 'alice'}
+        pr['reviews'] = {'nodes': [{'author': {'login': 'bob'}}]}
+        assert _skip_if_self_merge_without_approval(pr, 'org/repo') is None
+
+    def test_self_merge_with_only_self_review_returns_reason(self):
+        pr = _make_pr_node(99, 'org', 'repo')
+        pr['author'] = {'login': 'alice'}
+        pr['mergedBy'] = {'login': 'alice'}
+        pr['reviews'] = {'nodes': [{'author': {'login': 'alice'}}]}
+        assert _skip_if_self_merge_without_approval(pr, 'org/repo') is not None
+
+    def test_distinct_merger_returns_none(self):
+        pr = _make_pr_node(99, 'org', 'repo')
+        pr['author'] = {'login': 'alice'}
+        pr['mergedBy'] = {'login': 'bob'}
+        assert _skip_if_self_merge_without_approval(pr, 'org/repo') is None
+
+    def test_no_merger_returns_none(self):
+        pr = _make_pr_node(99, 'org', 'repo')
+        pr['mergedBy'] = None
+        assert _skip_if_self_merge_without_approval(pr, 'org/repo') is None
+
+
+class TestSkipIfSourceBranchIsAcceptable:
+    def test_internal_pr_with_acceptable_source_returns_reason(self):
+        pr = _make_pr_node(5, 'org', 'repo')
+        pr['headRepository'] = {'name': 'repo', 'owner': {'login': 'org'}}
+        pr['headRefName'] = 'develop'
+        reason = _skip_if_source_branch_is_acceptable(pr, 'org/repo', ['main', 'develop'])
+        assert reason is not None
+        assert "'develop'" in reason
+
+    def test_internal_pr_with_wildcard_source_returns_reason(self):
+        pr = _make_pr_node(5, 'org', 'repo')
+        pr['headRepository'] = {'name': 'repo', 'owner': {'login': 'org'}}
+        pr['headRefName'] = '3.0-dev'
+        reason = _skip_if_source_branch_is_acceptable(pr, 'org/repo', ['main', '*-dev'])
+        assert reason is not None
+
+    def test_internal_pr_with_feature_source_returns_none(self):
+        pr = _make_pr_node(5, 'org', 'repo')
+        pr['headRepository'] = {'name': 'repo', 'owner': {'login': 'org'}}
+        pr['headRefName'] = 'feature-branch'
+        assert _skip_if_source_branch_is_acceptable(pr, 'org/repo', ['main']) is None
+
+    def test_fork_pr_is_not_checked(self):
+        pr = _make_pr_node(5, 'org', 'repo')
+        pr['headRepository'] = {'name': 'repo', 'owner': {'login': 'forker'}}
+        pr['headRefName'] = 'main'
+        assert _skip_if_source_branch_is_acceptable(pr, 'org/repo', ['main']) is None
+
+    def test_missing_head_repository_returns_none(self):
+        pr = _make_pr_node(5, 'org', 'repo')
+        pr['headRepository'] = None
+        assert _skip_if_source_branch_is_acceptable(pr, 'org/repo', ['main']) is None
+
+
+class TestSkipIfTargetBranchNotAcceptable:
+    def test_unacceptable_base_returns_reason(self):
+        pr = _make_pr_node(8, 'org', 'repo')
+        pr['baseRefName'] = 'random-branch'
+        reason = _skip_if_target_branch_not_acceptable(pr, 'org/repo', 'main', ['main'])
+        assert reason is not None
+        assert "'random-branch'" in reason
+        assert "'main'" in reason
+
+    def test_default_base_returns_none(self):
+        pr = _make_pr_node(8, 'org', 'repo')
+        pr['baseRefName'] = 'main'
+        assert _skip_if_target_branch_not_acceptable(pr, 'org/repo', 'main', ['main']) is None
+
+    def test_additional_base_returns_none(self):
+        pr = _make_pr_node(8, 'org', 'repo')
+        pr['baseRefName'] = 'develop'
+        assert _skip_if_target_branch_not_acceptable(pr, 'org/repo', 'main', ['main', 'develop']) is None
+
+    def test_wildcard_base_returns_none(self):
+        pr = _make_pr_node(8, 'org', 'repo')
+        pr['baseRefName'] = '3.1-dev'
+        assert _skip_if_target_branch_not_acceptable(pr, 'org/repo', 'main', ['main', '*-dev']) is None
+
+
+class TestShouldSkipMergedPrOrchestrator:
+    @pytest.fixture(autouse=True)
+    def _clear_dev_mode(self, monkeypatch):
+        monkeypatch.delenv('DEV_MODE', raising=False)
+
+    def test_all_predicates_pass(self):
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        pr = _within_lookback_pr()
+        skip, reason = should_skip_merged_pr(pr, 'goodorg/goodrepo', _repo_config(), cutoff)
+        assert (skip, reason) == (False, None)
+
+    def test_short_circuits_on_first_failing_predicate(self):
+        """Missing mergedAt must short-circuit before the lookback check runs."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        pr = _within_lookback_pr()
+        pr['mergedAt'] = None
+        skip, reason = should_skip_merged_pr(pr, 'goodorg/goodrepo', _repo_config(), cutoff)
+        assert skip is True
+        assert reason is not None
+        assert 'mergedAt' in reason
+        assert 'lookback' not in reason
+
+    def test_predicates_run_in_documented_order(self):
+        """A maintainer-authored PR outside the lookback window should report the lookback reason first."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        pr = _within_lookback_pr()
+        pr['mergedAt'] = (datetime.now(timezone.utc) - timedelta(days=60)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        pr['authorAssociation'] = 'OWNER'
+        skip, reason = should_skip_merged_pr(pr, 'goodorg/goodrepo', _repo_config(), cutoff)
+        assert skip is True
+        assert reason is not None
+        assert 'lookback window' in reason
+        assert 'direct merge capabilities' not in reason
+
+    def test_default_branch_falls_back_to_main_when_unknown(self):
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        pr = _within_lookback_pr()
+        pr['repository']['defaultBranchRef'] = None
+        pr['baseRefName'] = 'main'
+        skip, reason = should_skip_merged_pr(pr, 'goodorg/goodrepo', _repo_config(), cutoff)
+        assert (skip, reason) == (False, None)
+
+    def test_rejection_messages_unchanged(self):
+        """Pin specific reason strings so future edits cannot silently drift them.
+
+        Validators may parse or grep these messages, and the messages are also
+        used in audit logs. Any intentional change must update this test in
+        the same commit.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+
+        missing = _within_lookback_pr()
+        missing['mergedAt'] = None
+        _, reason = should_skip_merged_pr(missing, 'goodorg/goodrepo', _repo_config(), cutoff)
+        assert reason == 'PR #1 is MERGED, but missing a mergedAt timestamp. Skipping...'
+
+        old = _within_lookback_pr()
+        old['mergedAt'] = (datetime.now(timezone.utc) - timedelta(days=60)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        _, reason = should_skip_merged_pr(old, 'goodorg/goodrepo', _repo_config(), cutoff)
+        assert reason == 'Skipping PR #1 in goodorg/goodrepo - merged before 35-day lookback window'
+
+        maintainer = _within_lookback_pr()
+        maintainer['authorAssociation'] = 'OWNER'
+        _, reason = should_skip_merged_pr(maintainer, 'goodorg/goodrepo', _repo_config(), cutoff)
+        assert reason == ('Skipping PR #1 in goodorg/goodrepo - author is OWNER (has direct merge capabilities)')
+
+        self_merge = _within_lookback_pr()
+        self_merge['author'] = {'login': 'alice'}
+        self_merge['mergedBy'] = {'login': 'alice'}
+        self_merge['reviews'] = {'nodes': []}
+        _, reason = should_skip_merged_pr(self_merge, 'goodorg/goodrepo', _repo_config(), cutoff)
+        assert reason == 'Skipping PR #1 in goodorg/goodrepo - self-merged, no approval'
+
+        bad_source = _within_lookback_pr()
+        bad_source['headRepository'] = {'name': 'goodrepo', 'owner': {'login': 'goodorg'}}
+        bad_source['headRefName'] = 'develop'
+        _, reason = should_skip_merged_pr(bad_source, 'goodorg/goodrepo', _repo_config(additional=['develop']), cutoff)
+        assert reason == (
+            "Skipping PR #1 in goodorg/goodrepo - source branch 'develop' is an acceptable branch "
+            '(merging between acceptable branches not allowed)'
+        )
+
+        bad_target = _within_lookback_pr()
+        bad_target['baseRefName'] = 'random'
+        _, reason = should_skip_merged_pr(bad_target, 'goodorg/goodrepo', _repo_config(), cutoff)
+        assert reason == (
+            "Skipping PR #1 in goodorg/goodrepo - merged to 'random' (not default branch 'main' "
+            'or additional acceptable branches)'
+        )
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
